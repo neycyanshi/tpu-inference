@@ -17,6 +17,8 @@
 # Spin up the vLLM server
 model_name="${TEST_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
 tp_size="${TENSOR_PARALLEL_SIZE:-1}"
+dp_size="${DATA_PARALLEL_SIZE:-}"
+kv_cache_dtype="${KV_CACHE_DTYPE:-}"
 max_model_len=16384
 block_size="${BLOCK_SIZE:-}"
 dataset_name="random-mm"
@@ -29,6 +31,20 @@ LOG_FILE="server.log"
 BENCHMARK_LOG_FILE="benchmark.log"
 TARGET_THROUGHPUT="${MINIMUM_THROUGHPUT_THRESHOLD:-0.76}"
 exit_code=0
+
+passthrough_serve_args=()
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --additional-serve-flag=*)
+            passthrough_serve_args+=("${1#--additional-serve-flag=}")
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 
 
@@ -95,9 +111,16 @@ checkThroughput() {
 
 echo "Spinning up the vLLM server..."
 vllm_cmd=(vllm serve "$model_name" --tensor-parallel-size "$tp_size" --pipeline-parallel-size 1 --dtype bfloat16 --gpu-memory-utilization 0.98 --max-model-len "$max_model_len" --limit-mm-per-prompt '{"image": 10, "video": 0}' --mm-processor-kwargs '{"size": {"longest_edge": 1003520, "shortest_edge": 3136}}' --disable-chunked-mm-input)
+if [ -n "$dp_size" ]; then
+    vllm_cmd+=(--data-parallel-size "$dp_size")
+fi
+if [ -n "$kv_cache_dtype" ]; then
+    vllm_cmd+=(--kv-cache-dtype "$kv_cache_dtype")
+fi
 if [ -n "$block_size" ]; then
     vllm_cmd+=(--block-size "$block_size")
 fi
+vllm_cmd+=("${passthrough_serve_args[@]}")
 "${vllm_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" &
 
 
