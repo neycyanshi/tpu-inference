@@ -1418,17 +1418,79 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 max_num_reqs_per_dp_rank)
 
     def _prepare_async_token_substitution_indices(
+            self, req_ids_dp, req_indices_dp, scheduled_tokens_per_dp_rank,
+            padded_num_scheduled_tokens_per_dp_rank,
+            num_draft_tokens_per_dp_rank, dp_size):
+        """
+        Vectorized non-spec path.
+        Spec path _prepare_async_token_substitution_indices_spec_decode (TODO(gxd3):
+        spec+DP).
+        """
+        assert self._pre_async_results is not None
+        if self.speculative_config is not None:
+            return self._prepare_async_token_substitution_indices_spec_decode(
+                req_ids_dp, scheduled_tokens_per_dp_rank,
+                padded_num_scheduled_tokens_per_dp_rank,
+                num_draft_tokens_per_dp_rank, dp_size)
+
+        token_in_tpu_cur_input_indices_dp = {}
+        token_in_tpu_pre_next_tokens_indices_dp = {}
+        # Drafts unused without spec decoding; keep the 4-dict shape.
+        draft_token_in_tpu_cur_indices_dp = {r: [] for r in range(dp_size)}
+        draft_token_in_prev_next_tokens_indices_dp = {
+            r: [] for r in range(dp_size)
+        }
+
+        # Position-keyed placeholder map for the *current* batch. Batch slots
+        # can shift between steps, so translate via current req_id_to_index.
+        # Each entry: cur_idx -> slot in previous step's next_tokens tensor.
+        ph_dict = self._pre_async_results.placeholder_req_id_to_index
+        cur_r2i = self.input_batch.req_id_to_index
+        num_reqs_now = self.input_batch.num_reqs
+        placeholder_idx_arr = np.full(num_reqs_now, -1, dtype=np.int64)
+        for req_id, pre_next_tokens_idx in ph_dict.items():
+            cur_idx = cur_r2i.get(req_id)
+            if cur_idx is not None and cur_idx < num_reqs_now:
+                placeholder_idx_arr[cur_idx] = pre_next_tokens_idx
+
+        for dp_rank in range(dp_size):
+            req_indices = np.array(req_indices_dp[dp_rank], dtype=np.int64)
+            # Empty rank (dp_size > 1, unused) falls into `not mask.any()`.
+            idx_arr = placeholder_idx_arr[req_indices]
+            mask = idx_arr >= 0
+
+            if not mask.any():
+                token_in_tpu_cur_input_indices_dp[dp_rank] = []
+                token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = []
+                continue
+
+            token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
+            n_per_req = np.array(scheduled_tokens_per_dp_rank[dp_rank],
+                                 dtype=np.int64)
+            cum = np.cumsum(n_per_req) + token_offset  # acc_cur_len[i]
+            token_in_tpu_cur_input_indices_dp[dp_rank] = (cum[mask] -
+                                                          1).tolist()
+            token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = (
+                idx_arr[mask].tolist())
+
+        return (token_in_tpu_cur_input_indices_dp,
+                token_in_tpu_pre_next_tokens_indices_dp,
+                draft_token_in_tpu_cur_indices_dp,
+                draft_token_in_prev_next_tokens_indices_dp)
+
+    def _prepare_async_token_substitution_indices_spec_decode(
             self, req_ids_dp, scheduled_tokens_per_dp_rank,
             padded_num_scheduled_tokens_per_dp_rank,
             num_draft_tokens_per_dp_rank, dp_size):
-        """Prepare token substitution indices for async scheduling."""
-        # For input_ids substitution.
+        """Spec-decode substitution-index builder. Kept close to the
+        original loop-based form. TODO(gxd3): when spec+DP lands, mirror
+        the vectorized non-spec path.
+        """
+        assert self._pre_async_results is not None
         token_in_tpu_cur_input_indices_dp = {}
         token_in_tpu_pre_next_tokens_indices_dp = {}
-        # For SpecDecodeMetadata.draft_token_ids substitution.
         draft_token_in_tpu_cur_indices_dp = {}
         draft_token_in_prev_next_tokens_indices_dp = {}
-        spec_decode_enabled = (self.speculative_config is not None)
 
         for dp_rank in range(dp_size):
             token_in_tpu_cur_input_indices_dp[dp_rank] = []
@@ -1439,14 +1501,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
                 dp_rank]
             num_draft_tokens = num_draft_tokens_per_dp_rank.get(dp_rank, {})
-            token_in_tpu_cur_input_indices_list = token_in_tpu_cur_input_indices_dp[
-                dp_rank]
-            token_in_tpu_pre_next_tokens_indices_list = token_in_tpu_pre_next_tokens_indices_dp[
-                dp_rank]
-            draft_token_in_tpu_cur_indices_list = draft_token_in_tpu_cur_indices_dp[
-                dp_rank]
-            draft_token_in_prev_next_tokens_indices_list = draft_token_in_prev_next_tokens_indices_dp[
-                dp_rank]
+            token_in_tpu_cur_input_indices_list = (
+                token_in_tpu_cur_input_indices_dp[dp_rank])
+            token_in_tpu_pre_next_tokens_indices_list = (
+                token_in_tpu_pre_next_tokens_indices_dp[dp_rank])
+            draft_token_in_tpu_cur_indices_list = (
+                draft_token_in_tpu_cur_indices_dp[dp_rank])
+            draft_token_in_prev_next_tokens_indices_list = (
+                draft_token_in_prev_next_tokens_indices_dp[dp_rank])
 
             token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
             acc_cur_len = token_offset
@@ -1460,34 +1522,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 if req_id not in self._pre_async_results.placeholder_req_id_to_index:
                     continue
 
-                if not spec_decode_enabled:
-                    token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
+                max_num_spec_tokens = self.speculative_config.num_speculative_tokens
+                assert num_scheduled_tokens_per_req[
+                    i] <= max_num_spec_tokens + 1
+                idx = self._pre_async_results.placeholder_req_id_to_index[
+                    req_id]
+
+                base_offset = acc_cur_len - num_scheduled_tokens_per_req[i]
+                for j in range(num_scheduled_tokens_per_req[i]):
+                    token_in_tpu_cur_input_indices_list.append(base_offset + j)
                     token_in_tpu_pre_next_tokens_indices_list.append(
-                        self._pre_async_results.
-                        placeholder_req_id_to_index[req_id])
-                else:
-                    max_num_spec_tokens = self.speculative_config.num_speculative_tokens
-                    assert num_scheduled_tokens_per_req[
-                        i] <= max_num_spec_tokens + 1
-                    idx = self._pre_async_results.placeholder_req_id_to_index[
-                        req_id]
+                        idx * (max_num_spec_tokens + 1) + j)
 
-                    base_offset = acc_cur_len - num_scheduled_tokens_per_req[i]
-                    for j in range(num_scheduled_tokens_per_req[i]):
-                        token_in_tpu_cur_input_indices_list.append(
-                            base_offset + j)
-                        token_in_tpu_pre_next_tokens_indices_list.append(
-                            idx * (max_num_spec_tokens + 1) + j)
+                draft_base_offset = (draft_tokens_acc_cur_len -
+                                     num_draft_tokens[i])
+                for j in range(num_draft_tokens[i]):
+                    draft_token_in_tpu_cur_indices_list.append(
+                        draft_base_offset + j)
+                    draft_token_in_prev_next_tokens_indices_list.append(
+                        idx * (max_num_spec_tokens + 1) + j + 1)
 
-                    draft_base_offset = draft_tokens_acc_cur_len - num_draft_tokens[
-                        i]
-                    for j in range(num_draft_tokens[i]):
-                        draft_token_in_tpu_cur_indices_list.append(
-                            draft_base_offset + j)
-                        draft_token_in_prev_next_tokens_indices_list.append(
-                            idx * (max_num_spec_tokens + 1) + j + 1)
-
-        return token_in_tpu_cur_input_indices_dp, token_in_tpu_pre_next_tokens_indices_dp, draft_token_in_tpu_cur_indices_dp, draft_token_in_prev_next_tokens_indices_dp
+        return (token_in_tpu_cur_input_indices_dp,
+                token_in_tpu_pre_next_tokens_indices_dp,
+                draft_token_in_tpu_cur_indices_dp,
+                draft_token_in_prev_next_tokens_indices_dp)
 
     def _apply_async_token_substitution(self, input, next_tokens_in_tpu,
                                         token_in_tpu_cur_input_indices,
@@ -1612,7 +1670,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              draft_token_in_tpu_cur_indices_dp,
              draft_token_in_prev_next_tokens_indices_dp
              ) = self._prepare_async_token_substitution_indices(
-                 req_ids_dp, scheduled_tokens_per_dp_rank,
+                 req_ids_dp, req_indices_dp, scheduled_tokens_per_dp_rank,
                  padded_num_scheduled_tokens_per_dp_rank,
                  {0: num_draft_tokens}, dp_size)
 
