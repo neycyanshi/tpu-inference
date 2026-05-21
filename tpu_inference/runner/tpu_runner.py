@@ -903,6 +903,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     req_state.req_id] = logits_indices_selector[req_idx]
         return placeholder_req_id_to_index
 
+    def _build_placeholder_idx_arr(self) -> np.ndarray:
+        """Position-keyed view of the previous step's placeholder map for the
+        current batch: arr[cur_idx] = pre_next_tokens_idx, or -1 for slots
+        with no previous-step placeholder. Translates the string-keyed dict
+        through the current req_id_to_index so it stays correct across
+        batch-position shifts.
+        """
+        assert self._pre_async_results is not None
+        ph_dict = self._pre_async_results.placeholder_req_id_to_index
+        cur_r2i = self.input_batch.req_id_to_index
+        num_reqs_now = self.input_batch.num_reqs
+        arr = np.full(num_reqs_now, -1, dtype=np.int64)
+        for req_id, pre_next_tokens_idx in ph_dict.items():
+            cur_idx = cur_r2i.get(req_id)
+            if cur_idx is not None and cur_idx < num_reqs_now:
+                arr[cur_idx] = pre_next_tokens_idx
+        return arr
+
     def _execute_model(
         self,
         scheduler_output: "VllmSchedulerOutput",
@@ -1420,9 +1438,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _prepare_async_token_substitution_indices(
             self, req_ids_dp, req_indices_dp, scheduled_tokens_per_dp_rank,
             padded_num_scheduled_tokens_per_dp_rank,
-            num_draft_tokens_per_dp_rank, dp_size):
+            num_draft_tokens_per_dp_rank, dp_size, placeholder_idx_arr):
         """
-        Vectorized non-spec path.
+        Vectorized non-spec path. Caller passes `placeholder_idx_arr` from
+        `_build_placeholder_idx_arr` (shared with `_subtract_num_rejected_tokens`).
         Spec path _prepare_async_token_substitution_indices_spec_decode (TODO(gxd3):
         spec+DP).
         """
@@ -1440,18 +1459,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         draft_token_in_prev_next_tokens_indices_dp = {
             r: [] for r in range(dp_size)
         }
-
-        # Position-keyed placeholder map for the *current* batch. Batch slots
-        # can shift between steps, so translate via current req_id_to_index.
-        # Each entry: cur_idx -> slot in previous step's next_tokens tensor.
-        ph_dict = self._pre_async_results.placeholder_req_id_to_index
-        cur_r2i = self.input_batch.req_id_to_index
-        num_reqs_now = self.input_batch.num_reqs
-        placeholder_idx_arr = np.full(num_reqs_now, -1, dtype=np.int64)
-        for req_id, pre_next_tokens_idx in ph_dict.items():
-            cur_idx = cur_r2i.get(req_id)
-            if cur_idx is not None and cur_idx < num_reqs_now:
-                placeholder_idx_arr[cur_idx] = pre_next_tokens_idx
 
         for dp_rank in range(dp_size):
             req_indices = np.array(req_indices_dp[dp_rank], dtype=np.int64)
@@ -1585,35 +1592,37 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return input
 
     def _subtract_num_rejected_tokens(self, seq_lens, positions,
-                                      num_scheduled_tokens_per_req):
+                                      num_scheduled_tokens_per_req,
+                                      placeholder_idx_arr):
         """Apply rejection-count subtraction to seq_lens and positions if needed.
 
         `num_computed_tokens_cpu` was advanced on the host assuming every
         speculatively proposed token from the previous step was accepted. Here
         we subtract the actual rejection counts on TPU for the requests that
         ran spec decoding in the previous step.
+
+        Vectorized using `placeholder_idx_arr` (shared with
+        `_prepare_async_token_substitution_indices`). Spec invariant:
+        dp_size == 1, so num_reqs == self.input_batch.num_reqs.
         """
         assert self._pre_async_results is not None
         assert self._pre_async_results.spec_decode_num_rejected_tokens is not None
         num_reqs = len(num_scheduled_tokens_per_req)
+        n_per_req = np.array(num_scheduled_tokens_per_req, dtype=np.int64)
+        # idx_per_req[i] = -1 for non-placeholders; np.repeat broadcasts -1
+        # into the corresponding token positions, so they remain "skip".
+        idx_per_req = placeholder_idx_arr[:num_reqs].astype(np.int32)
+        total = int(n_per_req.sum())
+
         seq_lens_subtract_indices = np.full(self.max_num_reqs,
                                             -1,
                                             dtype=np.int32)
+        seq_lens_subtract_indices[:num_reqs] = idx_per_req
+
         positions_subtract_indices = np.full(positions.size,
                                              -1,
                                              dtype=np.int32)
-
-        acc_cur_len = 0
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            acc_cur_len += num_scheduled_tokens_per_req[i]
-            assert req_id is not None
-            if req_id not in self._pre_async_results.placeholder_req_id_to_index:
-                continue
-            idx = self._pre_async_results.placeholder_req_id_to_index[req_id]
-            seq_lens_subtract_indices[i] = idx
-            base_offset = acc_cur_len - num_scheduled_tokens_per_req[i]
-            for j in range(num_scheduled_tokens_per_req[i]):
-                positions_subtract_indices[base_offset + j] = idx
+        positions_subtract_indices[:total] = np.repeat(idx_per_req, n_per_req)
 
         seq_lens_subtract_indices, positions_subtract_indices = device_array(
             self.mesh, (seq_lens_subtract_indices, positions_subtract_indices))
@@ -1662,9 +1671,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         token_in_tpu_pre_next_tokens_indices_dp = {}
         draft_token_in_tpu_cur_indices_dp = {}
         draft_token_in_prev_next_tokens_indices_dp = {}
+        placeholder_idx_arr = None
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
-            # If async previous results exists, we will prepare for the token substitution here
-            # The actual substitution will be performed in tpu during later parts of this function.
+            # Build the position-keyed placeholder map once and share between
+            # _prepare_async_token_substitution_indices (non-spec) and
+            # _subtract_num_rejected_tokens (spec) below.
+            placeholder_idx_arr = self._build_placeholder_idx_arr()
             (token_in_tpu_cur_input_indices_dp,
              token_in_tpu_pre_next_tokens_indices_dp,
              draft_token_in_tpu_cur_indices_dp,
@@ -1672,7 +1684,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              ) = self._prepare_async_token_substitution_indices(
                  req_ids_dp, req_indices_dp, scheduled_tokens_per_dp_rank,
                  padded_num_scheduled_tokens_per_dp_rank,
-                 {0: num_draft_tokens}, dp_size)
+                 {0: num_draft_tokens}, dp_size, placeholder_idx_arr)
 
         self.device_buffer.reset()
 
@@ -1940,8 +1952,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # proposed tokens from the previous step were accepted. Subtract the
         # actual rejection counts from `seq_lens` and `positions` on TPU.
         if self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            assert placeholder_idx_arr is not None
             seq_lens, positions = self._subtract_num_rejected_tokens(
-                seq_lens, positions, scheduled_tokens_per_dp_rank[0])
+                seq_lens, positions, scheduled_tokens_per_dp_rank[0],
+                placeholder_idx_arr)
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
