@@ -1360,29 +1360,39 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         dp_size = self.dp_size
         num_reqs = self.input_batch.num_reqs
         max_num_reqs_per_dp_rank = self.max_num_reqs // dp_size
-        req_ids_dp = {dp_rank: [] for dp_rank in range(dp_size)}
-        req_indices_dp = {dp_rank: [] for dp_rank in range(dp_size)}
-        num_scheduled_tokens_per_dp_rank = {
-            dp_rank: 0
-            for dp_rank in range(dp_size)
-        }
-        scheduled_tokens_per_dp_rank = {
-            dp_rank: []
-            for dp_rank in range(dp_size)
-        }
-        num_req_per_dp_rank = {dp_rank: 0 for dp_rank in range(dp_size)}
 
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            dp_rank = (scheduler_output.assigned_dp_rank[req_id]
-                       if dp_size > 1 else 0)
-            req_ids_dp[dp_rank].append(req_id)
-            req_indices_dp[dp_rank].append(
-                self.input_batch.req_id_to_index[req_id])
-            num_scheduled_tokens_per_dp_rank[
-                dp_rank] += scheduler_output.num_scheduled_tokens[req_id]
-            scheduled_tokens_per_dp_rank[dp_rank].append(
-                scheduler_output.num_scheduled_tokens[req_id])
-            num_req_per_dp_rank[dp_rank] += 1
+        # DPScheduler already buckets reqs per rank in `req_ids_per_rank`;
+        # use it directly instead of re-bucketing via assigned_dp_rank. The
+        # base Scheduler (dp_size == 1) doesn't populate it, so synthesize a
+        # single-rank list in input-batch order for that path.
+        if dp_size > 1:
+            req_ids_per_rank = scheduler_output.req_ids_per_rank
+        else:
+            req_ids_per_rank = {0: list(self.input_batch.req_ids[:num_reqs])}
+
+        req_id_to_index = self.input_batch.req_id_to_index
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+
+        req_ids_dp: Dict[int, List[str]] = {}
+        req_indices_dp: Dict[int, List[int]] = {}
+        scheduled_tokens_per_dp_rank: Dict[int, List[int]] = {}
+        num_scheduled_tokens_per_dp_rank: Dict[int, int] = {}
+        num_req_per_dp_rank: Dict[int, int] = {}
+
+        for dp_rank in range(dp_size):
+            req_ids_in_rank = req_ids_per_rank.get(dp_rank, [])
+            num_scheduled_tokens_per_req = [
+                num_scheduled_tokens[r] for r in req_ids_in_rank
+            ]
+            req_ids_dp[dp_rank] = req_ids_in_rank
+            req_indices_dp[dp_rank] = [
+                req_id_to_index[r] for r in req_ids_in_rank
+            ]
+            scheduled_tokens_per_dp_rank[dp_rank] = (
+                num_scheduled_tokens_per_req)
+            num_scheduled_tokens_per_dp_rank[dp_rank] = sum(
+                num_scheduled_tokens_per_req)
+            num_req_per_dp_rank[dp_rank] = len(req_ids_in_rank)
 
         # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
