@@ -900,6 +900,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """Current-batch-keyed view of the prev step's placeholder map:
         arr[cur_idx] = slot in prev next_tokens (pre_req_idx, or
         selector[pre_req_idx] under DP), or -1 if no prev placeholder.
+
+        Hot loop collects into Python lists, then a single bulk fancy-index
+        assign — avoids per-iter numpy scalar-set overhead.
         """
         assert self._pre_async_results is not None
         pre = self._pre_async_results
@@ -907,15 +910,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         selector = pre.logits_indices_selector
         cur_r2i = self.input_batch.req_id_to_index
         num_reqs_now = self.input_batch.num_reqs
-        arr = np.full(num_reqs_now, -1, dtype=np.int64)
+
+        cur_idxs: list[int] = []
+        vals: list[int] = []
         for pre_req_idx, _, _ in pre.request_seq_lens:
             if pre_req_idx in discard:
                 continue
             cur_idx = cur_r2i.get(pre.req_ids[pre_req_idx])
             if cur_idx is None or cur_idx >= num_reqs_now:
                 continue
-            arr[cur_idx] = (pre_req_idx if selector is None else
-                            selector[pre_req_idx])
+            cur_idxs.append(cur_idx)
+            vals.append(pre_req_idx if selector is None else
+                        selector[pre_req_idx])
+
+        arr = np.full(num_reqs_now, -1, dtype=np.int64)
+        if cur_idxs:
+            arr[np.array(cur_idxs, dtype=np.intp)] = np.array(
+                vals, dtype=np.int64)
         return arr
 
     def _execute_model(
@@ -1455,14 +1466,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 padded_num_scheduled_tokens_per_dp_rank,
                 num_draft_tokens_per_dp_rank, dp_size)
 
-        token_in_tpu_cur_input_indices_dp = {}
-        token_in_tpu_pre_next_tokens_indices_dp = {}
-        # Drafts unused without spec decoding; keep the 4-dict shape.
+        token_in_tpu_cur_input_indices_dp: dict[int, np.ndarray] = {}
+        token_in_tpu_pre_next_tokens_indices_dp: dict[int, np.ndarray] = {}
+        # Drafts unused without spec decoding; spec path still returns lists,
+        # so keep these as lists for downstream `.extend`-style consumption.
         draft_token_in_tpu_cur_indices_dp = {r: [] for r in range(dp_size)}
         draft_token_in_prev_next_tokens_indices_dp = {
             r: [] for r in range(dp_size)
         }
 
+        empty = np.empty(0, dtype=np.int64)
         for dp_rank in range(dp_size):
             req_indices = np.array(req_indices_dp[dp_rank], dtype=np.int64)
             # Empty rank (dp_size > 1, unused) falls into `not mask.any()`.
@@ -1470,18 +1483,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             mask = idx_arr >= 0
 
             if not mask.any():
-                token_in_tpu_cur_input_indices_dp[dp_rank] = []
-                token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = []
+                token_in_tpu_cur_input_indices_dp[dp_rank] = empty
+                token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = empty
                 continue
 
             token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
             n_per_req = np.array(scheduled_tokens_per_dp_rank[dp_rank],
                                  dtype=np.int64)
             cum = np.cumsum(n_per_req) + token_offset  # acc_cur_len[i]
-            token_in_tpu_cur_input_indices_dp[dp_rank] = (cum[mask] -
-                                                          1).tolist()
-            token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = (
-                idx_arr[mask].tolist())
+            token_in_tpu_cur_input_indices_dp[dp_rank] = cum[mask] - 1
+            token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = idx_arr[mask]
 
         return (token_in_tpu_cur_input_indices_dp,
                 token_in_tpu_pre_next_tokens_indices_dp,
@@ -1992,17 +2003,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
-            # Collect all token indices that need substitution across all DP ranks
-            all_token_indices_to_substitute = []
-            all_pre_next_tokens_indices = []
+            # Non-spec path returns numpy arrays per rank — concatenate directly.
+            # Spec-path draft dicts still hold Python lists; collect via extend.
             draft_all_token_indices_to_substitute = []
             draft_all_pre_next_tokens_indices = []
-
             for dp_rank in range(dp_size):
-                cur_indices = token_in_tpu_cur_input_indices_dp[dp_rank]
-                pre_indices = token_in_tpu_pre_next_tokens_indices_dp[dp_rank]
-                all_token_indices_to_substitute.extend(cur_indices)
-                all_pre_next_tokens_indices.extend(pre_indices)
                 draft_all_token_indices_to_substitute.extend(
                     draft_token_in_tpu_cur_indices_dp[dp_rank])
                 draft_all_pre_next_tokens_indices.extend(
@@ -2013,10 +2018,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     next_tokens = self._pre_async_results.spec_decode_next_tokens
                 else:
                     next_tokens = self._pre_async_results.next_tokens
-                token_in_tpu_cur_input_indices = np.array(
-                    all_token_indices_to_substitute)
-                token_in_tpu_pre_next_tokens_indices = np.array(
-                    all_pre_next_tokens_indices)
+                token_in_tpu_cur_input_indices = np.concatenate([
+                    token_in_tpu_cur_input_indices_dp[r]
+                    for r in range(dp_size)
+                ])
+                token_in_tpu_pre_next_tokens_indices = np.concatenate([
+                    token_in_tpu_pre_next_tokens_indices_dp[r]
+                    for r in range(dp_size)
+                ])
                 input_ids = self._apply_async_token_substitution(
                     input_ids, next_tokens, token_in_tpu_cur_input_indices,
                     token_in_tpu_pre_next_tokens_indices)
