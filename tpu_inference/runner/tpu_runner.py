@@ -14,7 +14,9 @@
 
 import functools
 import logging
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -90,6 +92,12 @@ logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
+
+# Below this dp_size, the serial loop in _prepare_async_token_substitution_indices
+# is faster than dispatching through a ThreadPoolExecutor (per-task overhead
+# dominates when each rank has trivial work). Above it, threading wins because
+# the loop body is GIL-releasing numpy.
+_ASYNC_IDX_THREAD_THRESHOLD = 32
 
 
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -337,6 +345,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
         self.batch_counter = 0
+
+        # Long-lived thread pool for per-rank async substitution-index work at
+        # large dp_size. Threads are cheap when idle and the body releases the
+        # GIL throughout (after upstream list→ndarray conversion).
+        if self.dp_size >= _ASYNC_IDX_THREAD_THRESHOLD:
+            n_workers = min(self.dp_size, os.cpu_count() or 8)
+            self._async_idx_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+                max_workers=n_workers, thread_name_prefix="async_idx")
+        else:
+            self._async_idx_pool = None
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
@@ -1385,25 +1403,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
         req_ids_dp: Dict[int, List[str]] = {}
-        req_indices_dp: Dict[int, List[int]] = {}
-        scheduled_tokens_per_dp_rank: Dict[int, List[int]] = {}
+        req_indices_dp: Dict[int, np.ndarray] = {}
+        scheduled_tokens_per_dp_rank: Dict[int, np.ndarray] = {}
         num_scheduled_tokens_per_dp_rank: Dict[int, int] = {}
         num_req_per_dp_rank: Dict[int, int] = {}
 
         for dp_rank in range(dp_size):
             req_ids_in_rank = req_ids_per_rank.get(dp_rank, [])
-            num_scheduled_tokens_per_req = [
-                num_scheduled_tokens[r] for r in req_ids_in_rank
-            ]
+            n_in_rank = len(req_ids_in_rank)
+            # np.fromiter writes directly into a typed C buffer in one pass,
+            # avoiding the list→ndarray reconversion that would otherwise be
+            # forced inside the parallel section of
+            # _prepare_async_token_substitution_indices (which holds the GIL
+            # the entire time it iterates a Python list of ints).
+            num_scheduled_tokens_per_req = np.fromiter(
+                (num_scheduled_tokens[r] for r in req_ids_in_rank),
+                dtype=np.int64,
+                count=n_in_rank,
+            )
             req_ids_dp[dp_rank] = req_ids_in_rank
-            req_indices_dp[dp_rank] = [
-                req_id_to_index[r] for r in req_ids_in_rank
-            ]
+            req_indices_dp[dp_rank] = np.fromiter(
+                (req_id_to_index[r] for r in req_ids_in_rank),
+                dtype=np.int64,
+                count=n_in_rank,
+            )
             scheduled_tokens_per_dp_rank[dp_rank] = (
                 num_scheduled_tokens_per_req)
-            num_scheduled_tokens_per_dp_rank[dp_rank] = sum(
-                num_scheduled_tokens_per_req)
-            num_req_per_dp_rank[dp_rank] = len(req_ids_in_rank)
+            num_scheduled_tokens_per_dp_rank[dp_rank] = int(
+                num_scheduled_tokens_per_req.sum())
+            num_req_per_dp_rank[dp_rank] = n_in_rank
 
         # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
@@ -1476,23 +1504,38 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         }
 
         empty = np.empty(0, dtype=np.int64)
-        for dp_rank in range(dp_size):
-            req_indices = np.array(req_indices_dp[dp_rank], dtype=np.int64)
-            # Empty rank (dp_size > 1, unused) falls into `not mask.any()`.
+
+        # Pre-pack inputs so the worker just unpacks a tuple — no dict lookups
+        # held under the GIL inside the parallel section. After upstream
+        # conversion, req_indices and n_per_req are already int64 ndarrays,
+        # so the body is fully GIL-releasing numpy.
+        work = [
+            (dp_rank, req_indices_dp[dp_rank],
+             scheduled_tokens_per_dp_rank[dp_rank])
+            for dp_rank in range(dp_size)
+        ]
+
+        def _one_rank(args):
+            dp_rank, req_indices, n_per_req = args
             idx_arr = placeholder_idx_arr[req_indices]
             mask = idx_arr >= 0
-
             if not mask.any():
-                token_in_tpu_cur_input_indices_dp[dp_rank] = empty
-                token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = empty
-                continue
-
+                return dp_rank, empty, empty
             token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
-            n_per_req = np.array(scheduled_tokens_per_dp_rank[dp_rank],
-                                 dtype=np.int64)
             cum = np.cumsum(n_per_req) + token_offset  # acc_cur_len[i]
-            token_in_tpu_cur_input_indices_dp[dp_rank] = cum[mask] - 1
-            token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = idx_arr[mask]
+            return dp_rank, cum[mask] - 1, idx_arr[mask]
+
+        pool = self._async_idx_pool
+        if pool is not None:
+            n_workers = pool._max_workers
+            chunksize = max(1, dp_size // n_workers)
+            results = pool.map(_one_rank, work, chunksize=chunksize)
+        else:
+            results = map(_one_rank, work)
+
+        for dp_rank, cur, pre in results:
+            token_in_tpu_cur_input_indices_dp[dp_rank] = cur
+            token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = pre
 
         return (token_in_tpu_cur_input_indices_dp,
                 token_in_tpu_pre_next_tokens_indices_dp,
