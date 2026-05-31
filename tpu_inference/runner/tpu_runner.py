@@ -93,11 +93,12 @@ INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
 
-# Below this dp_size, the serial loop in _prepare_async_token_substitution_indices
-# is faster than dispatching through a ThreadPoolExecutor (per-task overhead
-# dominates when each rank has trivial work). Above it, threading wins because
-# the loop body is GIL-releasing numpy.
-_ASYNC_IDX_THREAD_THRESHOLD = 32
+# Below this dp_size, the serial per-rank loops in _prepare_inputs and
+# _prepare_async_token_substitution_indices are faster than dispatching through
+# a ThreadPoolExecutor (per-task overhead dominates when each rank has trivial
+# work). Above it, threading wins because the loop bodies are GIL-releasing
+# numpy.
+_DP_THREAD_THRESHOLD = 32
 
 
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -346,15 +347,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.execute_model_state: ExecuteModelState | None = None
         self.batch_counter = 0
 
-        # Long-lived thread pool for per-rank async substitution-index work at
-        # large dp_size. Threads are cheap when idle and the body releases the
-        # GIL throughout (after upstream list→ndarray conversion).
-        if self.dp_size >= _ASYNC_IDX_THREAD_THRESHOLD:
+        # Long-lived thread pool for per-rank host-side work at large dp_size.
+        # Used by _prepare_async_token_substitution_indices and the per-rank
+        # populate/block-table loops in _prepare_inputs. Threads are cheap when
+        # idle and those loop bodies release the GIL throughout (after upstream
+        # list→ndarray conversion in _prepare_input_metadata).
+        if self.dp_size >= _DP_THREAD_THRESHOLD:
             n_workers = min(self.dp_size, os.cpu_count() or 8)
-            self._async_idx_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
-                max_workers=n_workers, thread_name_prefix="async_idx")
+            self._dp_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+                max_workers=n_workers, thread_name_prefix="dp_worker")
         else:
-            self._async_idx_pool = None
+            self._dp_pool = None
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
@@ -1384,6 +1387,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logprobs = compute_logprobs(logits)
         return gather_logprobs(logprobs, next_tokens, max_logprobs)
 
+    def _dp_map(self, fn, iterable):
+        """Apply `fn` over a per-rank iterable, parallel via `_dp_pool` when
+        available, otherwise serial. Returns an iterator of results — use
+        this when the caller needs the values back. For side-effect-only
+        workers, use `_dp_for_each` instead. `iterable` must support `len()`
+        so chunksize can be computed.
+        """
+        pool = self._dp_pool
+        if pool is None:
+            return map(fn, iterable)
+        chunksize = max(1, len(iterable) // pool._max_workers)
+        return pool.map(fn, iterable, chunksize=chunksize)
+
+    def _dp_for_each(self, fn, iterable):
+        """Eager-consume variant of `_dp_map` for side-effect-only workers."""
+        for _ in self._dp_map(fn, iterable):
+            pass
+
     def _prepare_input_metadata(self, scheduler_output: "VllmSchedulerOutput"):
 
         dp_size = self.dp_size
@@ -1525,15 +1546,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cum = np.cumsum(n_per_req) + token_offset  # acc_cur_len[i]
             return dp_rank, cum[mask] - 1, idx_arr[mask]
 
-        pool = self._async_idx_pool
-        if pool is not None:
-            n_workers = pool._max_workers
-            chunksize = max(1, dp_size // n_workers)
-            results = pool.map(_one_rank, work, chunksize=chunksize)
-        else:
-            results = map(_one_rank, work)
-
-        for dp_rank, cur, pre in results:
+        for dp_rank, cur, pre in self._dp_map(_one_rank, work):
             token_in_tpu_cur_input_indices_dp[dp_rank] = cur
             token_in_tpu_pre_next_tokens_indices_dp[dp_rank] = pre
 
@@ -1775,10 +1788,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_view = self.device_buffer.get_view(logits_indices_shape,
                                                           key="logits_indices")
 
-        # Populates input_ids and positions
-        for dp_rank in range(dp_size):
+        # Populates input_ids and positions. Each rank writes into a
+        # non-overlapping slice of input_ids_view / self.positions_cpu;
+        # reads from input_batch arrays are all read-only — safe to thread.
+        token_ids_flat = self.input_batch.token_ids_cpu.ravel()
+        max_model_len = self.input_batch.token_ids_cpu.shape[1]
+        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu
+
+        def _populate_one_rank(dp_rank):
             if num_req_per_dp_rank[dp_rank] == 0:
-                continue
+                return
             token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
             num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
                 dp_rank]
@@ -1803,7 +1822,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Get positions.
             positions_np = positions_cpu[:total_num_scheduled_tokens]
             np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
+                num_computed_tokens_cpu[req_indices],
                 arange,
                 out=positions_np,
             )
@@ -1811,16 +1830,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
             # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
             # where M is the max_model_len.
-            token_indices = (
-                positions_np +
-                req_indices * self.input_batch.token_ids_cpu.shape[1])
+            token_indices = positions_np + req_indices * max_model_len
             np.take(
-                self.input_batch.token_ids_cpu.ravel(),
+                token_ids_flat,
                 token_indices,
                 out=input_ids_cpu[:total_num_scheduled_tokens],
             )
 
             input_ids_cpu[total_num_scheduled_tokens:] = 0
+
+        self._dp_for_each(_populate_one_rank, range(dp_size))
 
         # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
         for dp_rank in range(dp_size):
@@ -1884,12 +1903,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         _request_distribution = []
         for dp_rank in range(dp_size):
             _num_reqs = num_req_per_dp_rank[dp_rank]
-            # The batch has been reordered by _reorder_batch so decode requests come first
-            # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
-            num_decode_in_dp_rank = 0
-            for req_id in req_ids_dp[dp_rank]:
-                if scheduler_output.num_scheduled_tokens[req_id] == 1:
-                    num_decode_in_dp_rank += 1
+            # The batch has been reordered by _reorder_batch so decode requests
+            # come first. Count decode requests (scheduled_tokens == 1) in this
+            # DP rank via vectorized numpy comparison; scheduled_tokens_per_dp_rank
+            # is now an int64 ndarray (set in _prepare_input_metadata).
+            num_decode_in_dp_rank = int(
+                (scheduled_tokens_per_dp_rank[dp_rank] == 1).sum())
             _request_distribution.append(
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
         request_distribution = np.array(_request_distribution,
@@ -1942,11 +1961,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             block_tables_view.fill(0)
 
             cpu_tensor = block_table_obj.get_cpu_tensor()
-            for dp_rank in range(dp_size):
+
+            def _take_one_rank(dp_rank):
                 _num_reqs = num_req_per_dp_rank[dp_rank]
                 if _num_reqs == 0:
-                    continue
-
+                    return
                 req_offset = dp_rank * max_num_reqs_per_dp_rank
                 # Use np.take with out= to avoid intermediate copies from advanced indexing
                 np.take(cpu_tensor,
@@ -1954,6 +1973,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         axis=0,
                         out=block_tables_view[req_offset:req_offset +
                                               _num_reqs])
+
+            self._dp_for_each(_take_one_rank, range(dp_size))
 
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
